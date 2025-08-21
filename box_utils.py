@@ -1,8 +1,12 @@
 import os
 import pathlib
 import re
-from boxsdk import JWTAuth, Client
+import logging
+
+from boxsdk import JWTAuth, Client # type: ignore
 from boxsdk.exception import BoxAPIException
+
+logging.getLogger("boxsdk").setLevel(logging.WARNING)
 
 # ---------------- config for ignore ----------------
 JUNK_DIRS  = {"__MACOSX", ".git", ".venv", ".idea", ".pytest_cache", ".mypy_cache"}
@@ -33,7 +37,7 @@ def _find_child_by_name(folder, name: str):
                 return it
         offset += len(items)
 
-def _ensure_folder_path(client: Client, box_path: str, create_missing: bool = True) -> str:
+def _ensure_folder_path(client, box_path: str, create_missing: bool = True) -> str:
     """Resolve '/A/B/C' to a folder id, optionally creating segments."""
     if not box_path or box_path == "/":
         return "0"
@@ -67,6 +71,7 @@ def _upload_or_rename(client: Client, local_file: pathlib.Path, dest_folder_id: 
     """Upload file; auto-rename on conflict."""
     if is_ignored(local_file):
         return
+    print(f"Uploading {local_file} to Box folder {dest_folder_id}")
     folder = client.folder(dest_folder_id)
     base, ext = os.path.splitext(local_file.name)
     candidate = local_file.name
@@ -76,7 +81,7 @@ def _upload_or_rename(client: Client, local_file: pathlib.Path, dest_folder_id: 
         candidate = f"{base} ({i}){ext}"
         i += 1
     with open(local_file, "rb") as f:
-        # optionally: use chunked uploader for large files
+        # use chunked uploader for large files
         if local_file.stat().st_size >= 50 * 1024 * 1024 and hasattr(folder, "get_chunked_uploader"):
             uploader = folder.get_chunked_uploader(str(local_file))
             uploader.file_name = candidate  # ensure renamed name is used
@@ -99,7 +104,7 @@ def _ensure_subfolder(client: Client, parent_folder_id: str, name: str) -> str:
                 return existing.id
         raise
 
-def upload_folder_recursive(client: Client, local_dir: pathlib.Path, dest_folder_id: str):
+def upload_folder_recursive(client, local_dir: pathlib.Path, dest_folder_id: str):
     rel_to_box = {pathlib.Path("."): dest_folder_id}
     for root, dirs, files in os.walk(local_dir):
         root_path = pathlib.Path(root)
@@ -121,8 +126,8 @@ def upload_folder_recursive(client: Client, local_dir: pathlib.Path, dest_folder
                 continue
             _upload_or_rename(client, fpath, parent_box_id)
 
-def get_login_as_user(auth_path, username='devteam@ndsny.org'):
-    auth = JWTAuth.from_settings_file(auth_path)
+def get_login_as_user(auth_path, username):
+    auth = JWTAuth.from_settings_file(str(auth_path))
     admin_client = Client(auth)  # token minted for the app's service account
     # Look up your managed user by email (requires Manage Users scope)
     users = admin_client.users(limit=1000, filter_term=username)
@@ -133,8 +138,8 @@ def get_login_as_user(auth_path, username='devteam@ndsny.org'):
     user_client = admin_client.as_user(target)
     return user_client
 
-def upload_folder_to_path(auth_path, local_dir: str | pathlib.Path, box_path: str):
-    user_client = get_login_as_user(auth_path)
+def upload_folder_to_path(auth_path, local_dir: str | pathlib.Path, box_path: str, as_user: str):
+    user_client = get_login_as_user(auth_path, as_user)
     local_dir = pathlib.Path(local_dir).resolve()
     if not local_dir.is_dir():
         raise NotADirectoryError(local_dir)
