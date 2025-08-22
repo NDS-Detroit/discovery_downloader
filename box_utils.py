@@ -66,6 +66,15 @@ def _ensure_folder_path(client, box_path: str, create_missing: bool = True) -> s
                 raise
     return current_id
 
+def _is_same_content_conflict(e: BoxAPIException) -> bool:
+    try:
+        info = e.context_info or {}
+        c = (info.get("conflicts") or {})
+        return c.get("sha1") and c.get("file_version", {}).get("sha1") == c.get("sha1")
+    except Exception:
+        return False
+
+
 # ---------------- uploads with auto-rename ----------------
 def _upload_or_rename(client: Client, local_file: pathlib.Path, dest_folder_id: str):
     """Upload file; auto-rename on conflict."""
@@ -82,10 +91,43 @@ def _upload_or_rename(client: Client, local_file: pathlib.Path, dest_folder_id: 
         i += 1
     with open(local_file, "rb") as f:
         # use chunked uploader for large files
-        if local_file.stat().st_size >= 50 * 1024 * 1024 and hasattr(folder, "get_chunked_uploader"):
-            uploader = folder.get_chunked_uploader(str(local_file))
-            uploader.file_name = candidate  # ensure renamed name is used
-            uploader.start()
+        size = local_file.stat().st_size
+        if size >= 50 * 1024 * 1024 and hasattr(folder, "get_chunked_uploader"):
+            # Large files: we must provide the final name when creating the session.
+            while True:
+                try:
+                    # Optional but nice: preflight check to catch name conflicts before session
+                    try:
+                        folder.preflight_check(size=size, name=candidate)  # may raise 409
+                    except BoxAPIException as pe:
+                        if pe.status == 409:
+                            if _is_same_content_conflict(pe):
+                                print(f"Skipping duplicate (same SHA1): {local_file}")
+                                return
+                            # name in use -> bump and retry
+                            candidate = f"{base} ({i}){ext}"; i += 1
+                            continue
+                        else:
+                            raise
+
+                    # Create the upload session with the chosen (free) name
+                    session = folder.create_upload_session(size, candidate)
+                    # Use the session's chunked uploader to upload the stream
+                    # (SDK provides get_chunked_uploader on the UploadSession)
+                    uploader = session.get_chunked_uploader(str(local_file))
+                    uploader.start()
+                    break
+
+                except BoxAPIException as e:
+                    if e.status == 409:
+                        if _is_same_content_conflict(e):
+                            print(f"Skipping duplicate (same SHA1): {local_file}")
+                            return
+                        # name in use -> bump and retry
+                        candidate = f"{base} ({i}){ext}"; i += 1
+                        continue
+                    raise
+
         else:
             folder.upload_stream(f, candidate)
 
