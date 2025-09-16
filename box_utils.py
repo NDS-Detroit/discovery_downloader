@@ -93,39 +93,40 @@ def _upload_or_rename(client: Client, local_file: pathlib.Path, dest_folder_id: 
         # use chunked uploader for large files
         size = local_file.stat().st_size
         if size >= 50 * 1024 * 1024 and hasattr(folder, "get_chunked_uploader"):
-            # Large files: we must provide the final name when creating the session.
+            # Large files: create a fresh upload session and upload once.
             while True:
+                session = None
                 try:
-                    # Optional but nice: preflight check to catch name conflicts before session
+                    # Preflight to catch name conflict or duplicate SHA1
                     try:
-                        folder.preflight_check(size=size, name=candidate)  # may raise 409
+                        folder.preflight_check(size=size, name=candidate)
                     except BoxAPIException as pe:
                         if pe.status == 409:
                             if _is_same_content_conflict(pe):
                                 print(f"Skipping duplicate (same SHA1): {local_file}")
                                 return
-                            # name in use -> bump and retry
                             candidate = f"{base} ({i}){ext}"; i += 1
                             continue
-                        else:
-                            raise
+                        raise
 
-                    # Create the upload session with the chosen (free) name
+                    # Create a NEW session every attempt
                     session = folder.create_upload_session(size, candidate)
-                    # Use the session's chunked uploader to upload the stream
-                    # (SDK provides get_chunked_uploader on the UploadSession)
                     uploader = session.get_chunked_uploader(str(local_file))
-                    uploader.start()
-                    break
+                    uploader.start()  # uploads all parts + commit
+                    break  # success
 
                 except BoxAPIException as e:
-                    if e.status == 409:
-                        if _is_same_content_conflict(e):
-                            print(f"Skipping duplicate (same SHA1): {local_file}")
-                            return
-                        # name in use -> bump and retry
-                        candidate = f"{base} ({i}){ext}"; i += 1
+                    # If a part already exists in this session, abort and try a fresh session
+                    if e.status == 409 and ("Part id" in getattr(e, "message", "") or
+                                            "part" in (e.context_info or {}).get("code", "").lower()):
+                        try:
+                            if session:
+                                session.abort()
+                        except Exception:
+                            pass
+                        # try again with a fresh session (same candidate name)
                         continue
+                    # Name conflict or same-content duplicate already handled above; otherwise re-raise
                     raise
 
         else:
