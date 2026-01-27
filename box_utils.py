@@ -2,10 +2,12 @@ import os
 import pathlib
 import re
 import logging
+from pathlib import Path
 
 from boxsdk import JWTAuth, Client # type: ignore
 from boxsdk.exception import BoxAPIException
-
+from src.config import BOX_AUTH_PATH, BOX_USER
+from src.discovery.discovery_utils import prev_compose_email
 logging.getLogger("boxsdk").setLevel(logging.WARNING)
 
 # ---------------- config for ignore ----------------
@@ -92,7 +94,7 @@ def _upload_or_rename(client: Client, local_file: pathlib.Path, dest_folder_id: 
     with open(local_file, "rb") as f:
         # use chunked uploader for large files
         size = local_file.stat().st_size
-        if size >= 50 * 1024 * 1024 and hasattr(folder, "get_chunked_uploader"):
+        if size >= 500 * 1024 * 1024 and hasattr(folder, "get_chunked_uploader"):
             # Large files: create a fresh upload session and upload once.
             while True:
                 session = None
@@ -188,3 +190,19 @@ def upload_folder_to_path(auth_path, local_dir: str | pathlib.Path, box_path: st
         raise NotADirectoryError(local_dir)
     dest_id = _ensure_folder_path(user_client, box_path, create_missing=True)
     upload_folder_recursive(user_client, local_dir, dest_id)
+
+
+def upload_directory_to_box(dirname, attorney, client, subject,
+                            sender, body_text, casenum, date_str) -> str:
+    """Uploads a directory to box and composes email message"""
+    filelist_path = os.path.join(dirname, 'filelist.txt')
+    with open(filelist_path, 'w+', encoding='utf-8') as filelist:
+        email_message = prev_compose_email(
+            attorney, client, str(dirname), subject, sender, body_text, casenum)
+        filelist.write(email_message)
+    outdir_on_box = Path(dirname).name.split('-package')[0] + f"-{date_str}"
+    print("Uploading to Box:", outdir_on_box)
+
+    upload_folder_to_path(BOX_AUTH_PATH, dirname,
+        "/Evidence Files/" + outdir_on_box, BOX_USER)
+    return email_message
