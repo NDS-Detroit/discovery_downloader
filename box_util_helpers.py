@@ -1,6 +1,9 @@
+import logging
 import time, random
 from typing import Iterable, Dict, Set, Optional
 from boxsdk.exception import BoxAPIException
+
+log = logging.getLogger(__name__)
 
 # ---------- retry helpers ----------
 RETRY_STATUSES = {429, 500, 502, 503, 504}
@@ -18,7 +21,13 @@ def _with_retries(fn, *args, retries: int = 5, base: float = 0.8, **kwargs):
             if not _is_retryable(e) or attempt >= retries:
                 raise
             delay = base * (2 ** attempt) + random.uniform(0, 0.25)
-            print(f"Box transient error {getattr(e,'status',None)}; retry {attempt+1}/{retries} in {delay:.1f}s")
+            log.warning(
+                "Box transient error %s; retry %s/%s in %.1fs",
+                getattr(e, "status", None),
+                attempt + 1,
+                retries,
+                delay,
+            )
             time.sleep(delay)
             attempt += 1
 

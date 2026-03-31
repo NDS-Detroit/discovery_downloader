@@ -8,6 +8,8 @@ from boxsdk import JWTAuth, Client # type: ignore
 from boxsdk.exception import BoxAPIException
 from src.config import BOX_AUTH_PATH, BOX_USER
 from src.discovery.discovery_utils import prev_compose_email
+
+log = logging.getLogger(__name__)
 logging.getLogger("boxsdk").setLevel(logging.WARNING)
 
 # ---------------- config for ignore ----------------
@@ -82,7 +84,7 @@ def _upload_or_rename(client: Client, local_file: pathlib.Path, dest_folder_id: 
     """Upload file; auto-rename on conflict."""
     if is_ignored(local_file):
         return
-    print(f"Uploading {local_file} to Box folder {dest_folder_id}")
+    log.info("Uploading %s to Box folder %s", local_file, dest_folder_id)
     folder = client.folder(dest_folder_id)
     base, ext = os.path.splitext(local_file.name)
     candidate = local_file.name
@@ -105,7 +107,7 @@ def _upload_or_rename(client: Client, local_file: pathlib.Path, dest_folder_id: 
                     except BoxAPIException as pe:
                         if pe.status == 409:
                             if _is_same_content_conflict(pe):
-                                print(f"Skipping duplicate (same SHA1): {local_file}")
+                                log.info("Skipping duplicate (same SHA1): %s", local_file)
                                 return
                             candidate = f"{base} ({i}){ext}"; i += 1
                             continue
@@ -201,7 +203,7 @@ def upload_directory_to_box(dirname, attorney, client, subject,
             attorney, client, str(dirname), subject, sender, body_text, casenum)
         filelist.write(email_message)
     outdir_on_box = Path(dirname).name.split('-package')[0] + f"-{date_str}"
-    print("Uploading to Box:", outdir_on_box)
+    log.info("Uploading to Box: %s", outdir_on_box)
 
     upload_folder_to_path(BOX_AUTH_PATH, dirname,
         "/Evidence Files/" + outdir_on_box, BOX_USER)
