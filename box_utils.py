@@ -7,7 +7,10 @@ from pathlib import Path
 from boxsdk import JWTAuth, Client # type: ignore
 from boxsdk.exception import BoxAPIException
 from src.config import BOX_AUTH_PATH, BOX_USER
-from src.discovery.discovery_utils import prev_compose_email
+from src.discovery.discovery_utils import (
+    compose_discovery_email, package_summary, identify_source, html_to_text,
+    human_readable_size,
+)
 
 log = logging.getLogger(__name__)
 logging.getLogger("boxsdk").setLevel(logging.WARNING)
@@ -195,16 +198,41 @@ def upload_folder_to_path(auth_path, local_dir: str | pathlib.Path, box_path: st
 
 
 def upload_directory_to_box(dirname, attorney, client, subject,
-                            sender, body_text, casenum, date_str) -> str:
-    """Uploads a directory to box and composes email message"""
+                            sender, body_text, casenum, date_str, team='',
+                            extra=None, match_note='') -> str:
+    """Upload a discovery package to Box and return the HTML notification body.
+
+    The Box folder is resolved/created first so the email can link straight to
+    it (app.box.com/folder/<id> — attorneys already collaborate on Evidence
+    Files, so no shared link is needed). Then we summarize the package, compose
+    the notification, save a plain-text copy as filelist.txt, and upload."""
+    dirname = str(dirname)
+    if not os.path.isdir(dirname):
+        raise NotADirectoryError(dirname)
+
+    outdir_on_box = Path(dirname).name.split('-package')[0] + f"-{date_str}"
+    box_path = "/Evidence Files/" + outdir_on_box
+
+    user_client = get_login_as_user(BOX_AUTH_PATH, BOX_USER)
+    dest_id = _ensure_folder_path(user_client, box_path, create_missing=True)
+    box_url = f"https://app.box.com/folder/{dest_id}"
+
+    n_files, total_bytes, tree_text = package_summary(dirname)
+    source = identify_source(sender, subject, body_text)
+
+    email_message = compose_discovery_email(
+        client=client, attorney=attorney, team=team, casenum=casenum,
+        sender=sender, body_text=body_text, box_url=box_url,
+        box_path="Evidence Files/" + outdir_on_box, date_str=date_str,
+        source=source, n_files=n_files, total_bytes=total_bytes,
+        tree_text=tree_text, extra=extra, match_note=match_note,
+    )
+
     filelist_path = os.path.join(dirname, 'filelist.txt')
     with open(filelist_path, 'w+', encoding='utf-8') as filelist:
-        email_message = prev_compose_email(
-            attorney, client, str(dirname), subject, sender, body_text, casenum)
-        filelist.write(email_message)
-    outdir_on_box = Path(dirname).name.split('-package')[0] + f"-{date_str}"
-    log.info("Uploading to Box: %s", outdir_on_box)
+        filelist.write(html_to_text(email_message))
 
-    upload_folder_to_path(BOX_AUTH_PATH, dirname,
-        "/Evidence Files/" + outdir_on_box, BOX_USER)
+    log.info("Uploading to Box: %s (%s files, %s)", outdir_on_box, n_files,
+             human_readable_size(total_bytes))
+    upload_folder_recursive(user_client, Path(dirname).resolve(), dest_id)
     return email_message
