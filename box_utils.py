@@ -220,17 +220,28 @@ def upload_directory_to_box(dirname, attorney, client, subject,
     n_files, total_bytes, tree_text = package_summary(dirname)
     source = identify_source(sender, subject, body_text)
 
-    email_message = compose_discovery_email(
+    email_kwargs = dict(
         client=client, attorney=attorney, team=team, casenum=casenum,
         sender=sender, body_text=body_text, box_url=box_url,
         box_path="Evidence Files/" + outdir_on_box, date_str=date_str,
         source=source, n_files=n_files, total_bytes=total_bytes,
-        tree_text=tree_text, extra=extra, match_note=match_note,
+        extra=extra, match_note=match_note,
     )
 
+    # The emailed notification caps the file tree at 250 lines
+    # (package_summary's default) so the reply stays readable.
+    email_message = compose_discovery_email(**email_kwargs, tree_text=tree_text)
+
+    # filelist.txt is written into the package and uploaded to Box so an
+    # attorney can confirm the WHOLE download arrived — it must list every
+    # extracted file, not the 250-line-capped tree. Re-summarize with the cap
+    # lifted. (Restores the complete listing that regressed when the
+    # notification switched to the capped package_summary tree.)
+    _, _, full_tree = package_summary(dirname, max_lines=float('inf'))
     filelist_path = os.path.join(dirname, 'filelist.txt')
     with open(filelist_path, 'w+', encoding='utf-8') as filelist:
-        filelist.write(html_to_text(email_message))
+        filelist.write(html_to_text(
+            compose_discovery_email(**email_kwargs, tree_text=full_tree)))
 
     log.info("Uploading to Box: %s (%s files, %s)", outdir_on_box, n_files,
              human_readable_size(total_bytes))
