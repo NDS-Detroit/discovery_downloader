@@ -1,6 +1,7 @@
 import os
 import pathlib
 import re
+import hashlib
 import logging
 from pathlib import Path
 
@@ -32,17 +33,31 @@ def is_ignored(path: pathlib.Path) -> bool:
 def _sanitize(name: str) -> str:
     return re.sub(r"[^\w\-. ]+", "_", name).strip() or "unnamed"
 
-def _find_child_by_name(folder, name: str):
-    """Exact-name lookup within a Box folder."""
+def _find_child_by_name(folder, name: str, fields=None):
+    """Exact-name lookup within a Box folder.
+
+    `fields` is passed through to Box's get_items so callers that need extra
+    attributes (e.g. `sha1` for content dedupe) get them populated on the
+    returned item. Box always returns `id`/`type` regardless of `fields`."""
     offset = 0
     while True:
-        items = list(folder.get_items(limit=1000, offset=offset))
+        items = list(folder.get_items(limit=1000, offset=offset, fields=fields))
         if not items:
             return None
         for it in items:
             if it.name == name:
                 return it
         offset += len(items)
+
+
+def _sha1_of_file(path: pathlib.Path) -> str:
+    """SHA1 of a file's contents — the same digest Box stores per file, so a
+    match means Box already has this exact content."""
+    h = hashlib.sha1()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 def _ensure_folder_path(client, box_path: str, create_missing: bool = True) -> str:
     """Resolve '/A/B/C' to a folder id, optionally creating segments."""
@@ -87,15 +102,36 @@ def _upload_or_rename(client: Client, local_file: pathlib.Path, dest_folder_id: 
     """Upload file; auto-rename on conflict."""
     if is_ignored(local_file):
         return
-    log.info("Uploading %s to Box folder %s", local_file, dest_folder_id)
     folder = client.folder(dest_folder_id)
     base, ext = os.path.splitext(local_file.name)
+
+    # Resolve the destination name, content-aware:
+    #   same name + same SHA1 already on Box -> already uploaded, skip (idempotent)
+    #   same name + different content        -> auto-rename "(1)", "(2)", ...
+    #   name free                            -> upload as-is
+    # This makes a retry after a partially-failed package upload a no-op for the
+    # files that already landed, instead of re-uploading them as "name (1).ext"
+    # duplicates. SHA1 is computed only when a name actually collides, so a clean
+    # first upload (nothing pre-existing) reads no file bytes for the hash.
+    local_sha1 = None
     candidate = local_file.name
     i = 1
-    # find first free name
-    while _find_child_by_name(folder, candidate):
+    while True:
+        existing = _find_child_by_name(
+            folder, candidate, fields=["id", "type", "name", "sha1"])
+        if existing is None:
+            break
+        if getattr(existing, "type", None) == "file":
+            if local_sha1 is None:
+                local_sha1 = _sha1_of_file(local_file)
+            if getattr(existing, "sha1", None) == local_sha1:
+                log.info("Skipping %s -> Box folder %s (already uploaded, same SHA1)",
+                         local_file, dest_folder_id)
+                return
         candidate = f"{base} ({i}){ext}"
         i += 1
+
+    log.info("Uploading %s to Box folder %s", local_file, dest_folder_id)
     with open(local_file, "rb") as f:
         # use chunked uploader for large files
         size = local_file.stat().st_size
