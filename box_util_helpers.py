@@ -115,7 +115,7 @@ def _upload_or_rename(client: Client, local_file: pathlib.Path, dest_folder_id: 
     else:
         uploader = folder.get_chunked_uploader(str(local_file))
         uploader.file_name = candidate
-        # single-thread to avoid duplicate_part_id races we saw earlier
+        # single-thread to avoid duplicate_part_id races
         try:
             if hasattr(uploader, "_thread_pool_size"):
                 uploader._thread_pool_size = 1
