@@ -1,3 +1,4 @@
+import functools
 import os
 import pathlib
 import re
@@ -33,21 +34,42 @@ def is_ignored(path: pathlib.Path) -> bool:
 def _sanitize(name: str) -> str:
     return re.sub(r"[^\w\-. ]+", "_", name).strip() or "unnamed"
 
-def _find_child_by_name(folder, name: str, fields=None):
-    """Exact-name lookup within a Box folder.
-
-    `fields` is passed through to Box's get_items so callers that need extra
-    attributes (e.g. `sha1` for content dedupe) get them populated on the
-    returned item. Box always returns `id`/`type` regardless of `fields`."""
-    offset = 0
+def _list_children(folder) -> dict:
+    """{name: item} for every child of a Box folder, with `sha1` populated."""
+    children, offset = {}, 0
     while True:
-        items = list(folder.get_items(limit=1000, offset=offset, fields=fields))
-        if not items:
-            return None
-        for it in items:
-            if it.name == name:
-                return it
+        items = list(folder.get_items(limit=1000, offset=offset,
+                                      fields=["id", "type", "name", "sha1"]))
+        children.update((it.name, it) for it in items)
+        if len(items) < 1000:
+            return children
         offset += len(items)
+
+
+def _conflict_folder_id(e: BoxAPIException):
+    """Id of the existing folder a 409 folder-create collided with, if reported."""
+    c = (e.context_info or {}).get("conflicts")
+    c = c[0] if isinstance(c, list) and c else c
+    if isinstance(c, dict) and c.get("type") == "folder":
+        return c.get("id")
+    return None
+
+
+def _create_or_get_folder(parent, name: str):
+    """(folder id, created) for `name` under `parent`: create, or reuse the
+    existing folder Box names in the 409."""
+    try:
+        return parent.create_subfolder(name).id, True
+    except BoxAPIException as e:
+        if e.status != 409:
+            raise
+        fid = _conflict_folder_id(e)
+        if fid is None:
+            child = _list_children(parent).get(name)
+            if not (child and child.type == "folder"):
+                raise
+            fid = child.id
+        return fid, False
 
 
 def _sha1_of_file(path: pathlib.Path) -> str:
@@ -68,24 +90,13 @@ def _ensure_folder_path(client, box_path: str, create_missing: bool = True) -> s
     for seg in parts:
         name = _sanitize(seg)
         parent = client.folder(current_id)
-        child = _find_child_by_name(parent, name)
-        if child and child.type == "folder":
-            current_id = child.id
+        if create_missing:
+            current_id, _ = _create_or_get_folder(parent, name)
             continue
-        if not create_missing:
+        child = _list_children(parent).get(name)
+        if not (child and child.type == "folder"):
             raise FileNotFoundError(f"Missing segment '{name}' under folder {current_id}")
-        # create, handling concurrent create/conflict
-        try:
-            current_id = parent.create_subfolder(name).id
-        except BoxAPIException as e:
-            if e.status == 409:  # someone else created it
-                child = _find_child_by_name(parent, name)
-                if child and child.type == "folder":
-                    current_id = child.id
-                else:
-                    raise
-            else:
-                raise
+        current_id = child.id
     return current_id
 
 def _is_same_content_conflict(e: BoxAPIException) -> bool:
@@ -98,11 +109,15 @@ def _is_same_content_conflict(e: BoxAPIException) -> bool:
 
 
 # ---------------- uploads with auto-rename ----------------
-def _upload_or_rename(client: Client, local_file: pathlib.Path, dest_folder_id: str):
-    """Upload file; auto-rename on conflict."""
+def _upload_or_rename(client: Client, local_file: pathlib.Path, dest_folder_id: str,
+                      children: dict | None = None):
+    """Upload file; auto-rename on conflict. `children` is the destination's
+    {name: item} listing, kept current here; listed fresh when not given."""
     if is_ignored(local_file):
         return
     folder = client.folder(dest_folder_id)
+    if children is None:
+        children = _list_children(folder)
     base, ext = os.path.splitext(local_file.name)
 
     # Resolve the destination name, content-aware:
@@ -117,8 +132,7 @@ def _upload_or_rename(client: Client, local_file: pathlib.Path, dest_folder_id: 
     candidate = local_file.name
     i = 1
     while True:
-        existing = _find_child_by_name(
-            folder, candidate, fields=["id", "type", "name", "sha1"])
+        existing = children.get(candidate)
         if existing is None:
             break
         if getattr(existing, "type", None) == "file":
@@ -155,7 +169,7 @@ def _upload_or_rename(client: Client, local_file: pathlib.Path, dest_folder_id: 
                     # Create a NEW session every attempt
                     session = folder.create_upload_session(size, candidate)
                     uploader = session.get_chunked_uploader(str(local_file))
-                    uploader.start()  # uploads all parts + commit
+                    uploaded = uploader.start()  # uploads all parts + commit
                     break  # success
 
                 except BoxAPIException as e:
@@ -173,25 +187,20 @@ def _upload_or_rename(client: Client, local_file: pathlib.Path, dest_folder_id: 
                     raise
 
         else:
-            folder.upload_stream(f, candidate)
-
-def _ensure_subfolder(client: Client, parent_folder_id: str, name: str) -> str:
-    clean = _sanitize(name)
-    parent = client.folder(parent_folder_id)
-    existing = _find_child_by_name(parent, clean)
-    if existing and existing.type == "folder":
-        return existing.id
-    try:
-        return parent.create_subfolder(clean).id
-    except BoxAPIException as e:
-        if e.status == 409:  # created elsewhere between find/create
-            existing = _find_child_by_name(parent, clean)
-            if existing and existing.type == "folder":
-                return existing.id
-        raise
+            uploaded = folder.upload_stream(f, candidate)
+    children[candidate] = uploaded
 
 def upload_folder_recursive(client, local_dir: pathlib.Path, dest_folder_id: str):
+    """Mirror local_dir into dest_folder_id. Each pre-existing Box folder is
+    listed once; folders created here start empty and are never listed."""
     rel_to_box = {pathlib.Path("."): dest_folder_id}
+    listings = {}  # Box folder id -> {name: item}
+
+    def children_of(folder_id):
+        if folder_id not in listings:
+            listings[folder_id] = _list_children(client.folder(folder_id))
+        return listings[folder_id]
+
     for root, dirs, files in os.walk(local_dir):
         root_path = pathlib.Path(root)
         # prune junk dirs in-place
@@ -200,9 +209,10 @@ def upload_folder_recursive(client, local_dir: pathlib.Path, dest_folder_id: str
         rel = root_path.relative_to(local_dir)
         parent_box_id = rel_to_box[rel]
 
-        # ensure subfolders (find-or-create)
         for d in dirs:
-            sub_id = _ensure_subfolder(client, parent_box_id, d)
+            sub_id, created = _create_or_get_folder(client.folder(parent_box_id), _sanitize(d))
+            if created:
+                listings[sub_id] = {}
             rel_to_box[rel / d] = sub_id
 
         # upload files (auto-rename)
@@ -210,8 +220,9 @@ def upload_folder_recursive(client, local_dir: pathlib.Path, dest_folder_id: str
             fpath = root_path / fname
             if is_ignored(fpath):
                 continue
-            _upload_or_rename(client, fpath, parent_box_id)
+            _upload_or_rename(client, fpath, parent_box_id, children_of(parent_box_id))
 
+@functools.lru_cache(maxsize=None)
 def get_login_as_user(auth_path, username):
     auth = JWTAuth.from_settings_file(str(auth_path))
     admin_client = Client(auth)  # token minted for the app's service account
