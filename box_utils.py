@@ -22,13 +22,9 @@ JUNK_DIRS  = {"__MACOSX", ".git", ".venv", ".idea", ".pytest_cache", ".mypy_cach
 JUNK_FILES = {".DS_Store", "Thumbs.db", "desktop.ini"}
 
 def is_ignored(path: pathlib.Path) -> bool:
-    name = path.name
-    if name in JUNK_FILES or name.startswith("."):
+    if path.name in JUNK_FILES:
         return True
-    for part in path.parts:
-        if part in JUNK_DIRS or part.startswith("."):
-            return True
-    return False
+    return any(part in JUNK_DIRS for part in path.parts)
 
 # ---------------- Box folder utilities ----------------
 def _sanitize(name: str) -> str:
