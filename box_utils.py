@@ -46,6 +46,8 @@ BOX_BUDGET_ALERT_TO = ["efeasley@ndsdetroit.org"]
 BOX_BUDGET_WAIT_SECS = 15 * 60
 _CALLS_DB = Path(DEV_PATH) / "logs" / "box_calls.db"
 
+BOX_EVIDENCE_FOLDER_ID = "333769340825"  # the shared "Evidence Files" folder
+
 def is_ignored(path: pathlib.Path) -> bool:
     if path.name in JUNK_FILES:
         return True
@@ -103,7 +105,9 @@ def _sha1_of_file(path: pathlib.Path) -> str:
     return h.hexdigest()
 
 def _ensure_folder_path(client, box_path: str, create_missing: bool = True) -> str:
-    """Resolve '/A/B/C' to a folder id, optionally creating segments."""
+    """Resolve '/A/B/C' to a folder id. Each segment is looked up in its
+    parent's listing (which includes folders shared with this user) and
+    created only when missing."""
     if not box_path or box_path == "/":
         return "0"
     parts = [p for p in box_path.split("/") if p]
@@ -111,13 +115,13 @@ def _ensure_folder_path(client, box_path: str, create_missing: bool = True) -> s
     for seg in parts:
         name = _sanitize(seg)
         parent = client.folder(current_id)
-        if create_missing:
-            current_id, _ = _create_or_get_folder(parent, name)
-            continue
         child = _list_children(parent).get(name)
-        if not (child and child.type == "folder"):
+        if child is not None and child.type == "folder":
+            current_id = child.id
+        elif create_missing:
+            current_id, _ = _create_or_get_folder(parent, name)
+        else:
             raise FileNotFoundError(f"Missing segment '{name}' under folder {current_id}")
-        current_id = child.id
     return current_id
 
 def _is_same_content_conflict(e: BoxAPIException) -> bool:
@@ -420,10 +424,10 @@ def upload_directory_to_box(dirname, attorney, client, subject,
         raise NotADirectoryError(dirname)
 
     outdir_on_box = Path(dirname).name.split('-package')[0] + f"-{date_str}"
-    box_path = "/Evidence Files/" + outdir_on_box
 
     user_client = get_login_as_user(BOX_AUTH_PATH, BOX_USER)
-    dest_id = _ensure_folder_path(user_client, box_path, create_missing=True)
+    dest_id, _ = _create_or_get_folder(user_client.folder(BOX_EVIDENCE_FOLDER_ID),
+                                       _sanitize(outdir_on_box))
     box_url = f"https://app.box.com/folder/{dest_id}"
 
     n_files, total_bytes, tree_text = package_summary(dirname)
