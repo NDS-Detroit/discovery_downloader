@@ -37,10 +37,9 @@ BUNDLE_MIN_FILES = 1_000               # subfolders with more files than this up
 BUNDLE_MAX_FILE_BYTES = 1024 ** 3      # files this size or larger stay out of the zip
 
 # ---------------- Box API call budget ----------------
-# Every Box request from this machine is counted in _CALLS_DB. At either budget,
-# Box calls wait and an alert goes out once a day; they resume when the day or
+# Every Box request from this machine is counted in _CALLS_DB. At the monthly
+# budget, Box calls wait and an alert goes out once a day; they resume when the
 # month rolls over.
-BOX_DAILY_CALL_BUDGET = 5_000
 BOX_MONTHLY_CALL_BUDGET = 80_000
 BOX_BUDGET_ALERT_TO = ["efeasley@ndsdetroit.org"]
 BOX_BUDGET_WAIT_SECS = 15 * 60
@@ -329,51 +328,48 @@ def upload_folder_recursive(client, local_dir: pathlib.Path, dest_folder_id: str
 
 
 def _count_box_call(day: str):
-    """(over_budget, day_calls, month_calls, first_alert_today); counts the
-    call for `day` only when under both budgets."""
+    """(over_budget, month_calls, first_alert_today); counts the call for
+    `day` only when the month is under budget."""
     _CALLS_DB.parent.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(_CALLS_DB, timeout=60, isolation_level=None)) as con:
         con.execute("CREATE TABLE IF NOT EXISTS box_calls (day TEXT PRIMARY KEY, "
                     "calls INTEGER NOT NULL DEFAULT 0, alerted INTEGER NOT NULL DEFAULT 0)")
         con.execute("BEGIN IMMEDIATE")
-        row = con.execute("SELECT calls FROM box_calls WHERE day = ?", (day,)).fetchone()
-        day_calls = row[0] if row else 0
         month_calls = con.execute("SELECT COALESCE(SUM(calls), 0) FROM box_calls WHERE day LIKE ?",
                                   (day[:7] + "-%",)).fetchone()[0]
-        if day_calls < BOX_DAILY_CALL_BUDGET and month_calls < BOX_MONTHLY_CALL_BUDGET:
+        if month_calls < BOX_MONTHLY_CALL_BUDGET:
             con.execute("INSERT INTO box_calls (day, calls) VALUES (?, 1) "
                         "ON CONFLICT(day) DO UPDATE SET calls = calls + 1", (day,))
-            result = (False, day_calls + 1, month_calls + 1, False)
+            result = (False, month_calls + 1, False)
         else:
             alert = con.execute("INSERT INTO box_calls (day, alerted) VALUES (?, 1) "
                                 "ON CONFLICT(day) DO UPDATE SET alerted = 1 WHERE alerted = 0",
                                 (day,)).rowcount == 1
-            result = (True, day_calls, month_calls, alert)
+            result = (True, month_calls, alert)
         con.execute("COMMIT")
         return result
 
 
 def _take_box_call():
-    """Count one Box API call, waiting while today or this month is at budget."""
+    """Count one Box API call, waiting while this month is at budget."""
     while True:
         try:
-            over, day_calls, month_calls, alert = _count_box_call(datetime.date.today().isoformat())
+            over, month_calls, alert = _count_box_call(datetime.date.today().isoformat())
         except sqlite3.Error:
             log.exception("Box call budget unavailable; allowing the call")
             return
         if not over:
             return
-        log.warning("Box call budget reached (%s today, %s this month); uploads waiting",
-                    day_calls, month_calls)
+        log.warning("Box monthly call budget reached (%s calls); uploads waiting", month_calls)
         if alert:
             try:
                 send_simple_email(
                     BOX_BUDGET_ALERT_TO, "Box uploads paused: API call budget reached",
                     f"Discovery uploads to Box are paused on {platform.node()}: "
-                    f"{day_calls:,} Box API calls today (budget {BOX_DAILY_CALL_BUDGET:,}), "
-                    f"{month_calls:,} this month (budget {BOX_MONTHLY_CALL_BUDGET:,}). "
-                    "Packages stay on disk and upload when the day or month rolls over. "
-                    "Budgets: BOX_*_CALL_BUDGET in src/discovery_downloader/box_utils.py.")
+                    f"{month_calls:,} Box API calls this month "
+                    f"(budget {BOX_MONTHLY_CALL_BUDGET:,}). Packages stay on disk and "
+                    "upload when the month rolls over. "
+                    "Budget: BOX_MONTHLY_CALL_BUDGET in src/discovery_downloader/box_utils.py.")
             except Exception:
                 log.exception("could not send the Box budget alert")
         time.sleep(BOX_BUDGET_WAIT_SECS)
