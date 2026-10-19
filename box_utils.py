@@ -1,18 +1,29 @@
+import datetime
 import functools
 import os
 import pathlib
+import platform
 import re
 import hashlib
 import logging
+import shutil
+import sqlite3
+import tempfile
+import time
+import zipfile
+from contextlib import closing
 from pathlib import Path
 
 from boxsdk import JWTAuth, Client # type: ignore
 from boxsdk.exception import BoxAPIException
-from src.config import BOX_AUTH_PATH, BOX_USER
+from boxsdk.network.default_network import DefaultNetwork
+from boxsdk.session.session import AuthorizedSession, Session
+from src.config import BOX_AUTH_PATH, BOX_USER, DEV_PATH
 from src.discovery.discovery_utils import (
     compose_discovery_email, package_summary, identify_source, html_to_text,
     human_readable_size,
 )
+from src.nds_utils.email import send_simple_email
 
 log = logging.getLogger(__name__)
 logging.getLogger("boxsdk").setLevel(logging.WARNING)
@@ -20,6 +31,20 @@ logging.getLogger("boxsdk").setLevel(logging.WARNING)
 # ---------------- config for ignore ----------------
 JUNK_DIRS  = {"__MACOSX", ".git", ".venv", ".idea", ".pytest_cache", ".mypy_cache"}
 JUNK_FILES = {".DS_Store", "Thumbs.db", "desktop.ini"}
+
+# ---------------- bundling ----------------
+BUNDLE_MIN_FILES = 1_000               # subfolders with more files than this upload as one zip
+BUNDLE_MAX_FILE_BYTES = 1024 ** 3      # files this size or larger stay out of the zip
+
+# ---------------- Box API call budget ----------------
+# Every Box request from this machine is counted in _CALLS_DB. At either budget,
+# Box calls wait and an alert goes out once a day; they resume when the day or
+# month rolls over.
+BOX_DAILY_CALL_BUDGET = 5_000
+BOX_MONTHLY_CALL_BUDGET = 80_000
+BOX_BUDGET_ALERT_TO = ["efeasley@ndsdetroit.org"]
+BOX_BUDGET_WAIT_SECS = 15 * 60
+_CALLS_DB = Path(DEV_PATH) / "logs" / "box_calls.db"
 
 def is_ignored(path: pathlib.Path) -> bool:
     if path.name in JUNK_FILES:
@@ -186,9 +211,65 @@ def _upload_or_rename(client: Client, local_file: pathlib.Path, dest_folder_id: 
             uploaded = folder.upload_stream(f, candidate)
     children[candidate] = uploaded
 
-def upload_folder_recursive(client, local_dir: pathlib.Path, dest_folder_id: str):
+def _bundle_dirs(local_dir: Path) -> dict:
+    """{subfolder: n_files} for the top-most subfolders of local_dir holding more
+    than BUNDLE_MIN_FILES files under BUNDLE_MAX_FILE_BYTES (recursively)."""
+    counts = {}
+    for root, dirs, files in os.walk(local_dir, topdown=False):
+        root_path = Path(root)
+        counts[root_path] = sum(
+            1 for f in files
+            if not is_ignored(root_path / f)
+            and (root_path / f).stat().st_size < BUNDLE_MAX_FILE_BYTES
+        ) + sum(counts.get(root_path / d, 0) for d in dirs if not is_ignored(root_path / d))
+    bundles = {}
+    for root, dirs, _ in os.walk(local_dir):
+        root_path = Path(root)
+        keep = []
+        for d in dirs:
+            if is_ignored(root_path / d):
+                continue
+            if counts.get(root_path / d, 0) > BUNDLE_MIN_FILES:
+                bundles[root_path / d] = counts[root_path / d]
+            else:
+                keep.append(d)
+        dirs[:] = keep
+    return bundles
+
+
+def _zip_small_files(src: Path, zip_path: Path) -> list:
+    """Write src's files under BUNDLE_MAX_FILE_BYTES to an uncompressed zip with
+    fixed timestamps (same bytes on every run); return the files left out."""
+    big = []
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
+        for root, dirs, files in os.walk(src):
+            root_path = Path(root)
+            dirs[:] = sorted(d for d in dirs if not is_ignored(root_path / d))
+            for fname in sorted(files):
+                fpath = root_path / fname
+                if is_ignored(fpath):
+                    continue
+                size = fpath.stat().st_size
+                if size >= BUNDLE_MAX_FILE_BYTES:
+                    big.append(fpath)
+                    continue
+                info = zipfile.ZipInfo(fpath.relative_to(src).as_posix(),
+                                       date_time=(1980, 1, 1, 0, 0, 0))
+                info.file_size = size
+                with open(fpath, "rb") as fin, zf.open(info, "w") as fout:
+                    shutil.copyfileobj(fin, fout, 1024 * 1024)
+    return big
+
+
+def upload_folder_recursive(client, local_dir: pathlib.Path, dest_folder_id: str,
+                            bundles: dict | None = None):
     """Mirror local_dir into dest_folder_id. Each pre-existing Box folder is
-    listed once; folders created here start empty and are never listed."""
+    listed once; folders created here start empty and are never listed.
+    Each folder in `bundles` (default _bundle_dirs) uploads as <name>.zip inside
+    its Box folder, with files too big to zip uploaded beside it."""
+    local_dir = Path(local_dir)
+    if bundles is None:
+        bundles = _bundle_dirs(local_dir)
     rel_to_box = {pathlib.Path("."): dest_folder_id}
     listings = {}  # Box folder id -> {name: item}
 
@@ -196,6 +277,28 @@ def upload_folder_recursive(client, local_dir: pathlib.Path, dest_folder_id: str
         if folder_id not in listings:
             listings[folder_id] = _list_children(client.folder(folder_id))
         return listings[folder_id]
+
+    def subfolder(parent_id, name):
+        name = _sanitize(name)
+        existing = children_of(parent_id).get(name)
+        if existing is not None and existing.type == "folder":
+            return existing.id
+        sub_id, created = _create_or_get_folder(client.folder(parent_id), name)
+        if created:
+            listings[sub_id] = {}
+        return sub_id
+
+    def upload_bundle(src, folder_id):
+        log.info("Zipping %s (%s files) for Box folder %s", src, bundles[src], folder_id)
+        with tempfile.TemporaryDirectory(dir=local_dir.parent, prefix="box-bundle-") as scratch:
+            zip_path = Path(scratch) / f"{src.name}.zip"
+            big = _zip_small_files(src, zip_path)
+            _upload_or_rename(client, zip_path, folder_id, children_of(folder_id))
+        for fpath in big:
+            parent_id = folder_id
+            for part in fpath.parent.relative_to(src).parts:
+                parent_id = subfolder(parent_id, part)
+            _upload_or_rename(client, fpath, parent_id, children_of(parent_id))
 
     for root, dirs, files in os.walk(local_dir):
         root_path = pathlib.Path(root)
@@ -205,11 +308,13 @@ def upload_folder_recursive(client, local_dir: pathlib.Path, dest_folder_id: str
         rel = root_path.relative_to(local_dir)
         parent_box_id = rel_to_box[rel]
 
-        for d in dirs:
-            sub_id, created = _create_or_get_folder(client.folder(parent_box_id), _sanitize(d))
-            if created:
-                listings[sub_id] = {}
-            rel_to_box[rel / d] = sub_id
+        for d in list(dirs):
+            sub_id = subfolder(parent_box_id, d)
+            if root_path / d in bundles:
+                upload_bundle(root_path / d, sub_id)
+                dirs.remove(d)
+            else:
+                rel_to_box[rel / d] = sub_id
 
         # upload files (auto-rename)
         for fname in files:
@@ -218,10 +323,71 @@ def upload_folder_recursive(client, local_dir: pathlib.Path, dest_folder_id: str
                 continue
             _upload_or_rename(client, fpath, parent_box_id, children_of(parent_box_id))
 
+
+def _count_box_call(day: str):
+    """(over_budget, day_calls, month_calls, first_alert_today); counts the
+    call for `day` only when under both budgets."""
+    _CALLS_DB.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(_CALLS_DB, timeout=60, isolation_level=None)) as con:
+        con.execute("CREATE TABLE IF NOT EXISTS box_calls (day TEXT PRIMARY KEY, "
+                    "calls INTEGER NOT NULL DEFAULT 0, alerted INTEGER NOT NULL DEFAULT 0)")
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute("SELECT calls FROM box_calls WHERE day = ?", (day,)).fetchone()
+        day_calls = row[0] if row else 0
+        month_calls = con.execute("SELECT COALESCE(SUM(calls), 0) FROM box_calls WHERE day LIKE ?",
+                                  (day[:7] + "-%",)).fetchone()[0]
+        if day_calls < BOX_DAILY_CALL_BUDGET and month_calls < BOX_MONTHLY_CALL_BUDGET:
+            con.execute("INSERT INTO box_calls (day, calls) VALUES (?, 1) "
+                        "ON CONFLICT(day) DO UPDATE SET calls = calls + 1", (day,))
+            result = (False, day_calls + 1, month_calls + 1, False)
+        else:
+            alert = con.execute("INSERT INTO box_calls (day, alerted) VALUES (?, 1) "
+                                "ON CONFLICT(day) DO UPDATE SET alerted = 1 WHERE alerted = 0",
+                                (day,)).rowcount == 1
+            result = (True, day_calls, month_calls, alert)
+        con.execute("COMMIT")
+        return result
+
+
+def _take_box_call():
+    """Count one Box API call, waiting while today or this month is at budget."""
+    while True:
+        try:
+            over, day_calls, month_calls, alert = _count_box_call(datetime.date.today().isoformat())
+        except sqlite3.Error:
+            log.exception("Box call budget unavailable; allowing the call")
+            return
+        if not over:
+            return
+        log.warning("Box call budget reached (%s today, %s this month); uploads waiting",
+                    day_calls, month_calls)
+        if alert:
+            try:
+                send_simple_email(
+                    BOX_BUDGET_ALERT_TO, "Box uploads paused: API call budget reached",
+                    f"Discovery uploads to Box are paused on {platform.node()}: "
+                    f"{day_calls:,} Box API calls today (budget {BOX_DAILY_CALL_BUDGET:,}), "
+                    f"{month_calls:,} this month (budget {BOX_MONTHLY_CALL_BUDGET:,}). "
+                    "Packages stay on disk and upload when the day or month rolls over. "
+                    "Budgets: BOX_*_CALL_BUDGET in src/discovery_downloader/box_utils.py.")
+            except Exception:
+                log.exception("could not send the Box budget alert")
+        time.sleep(BOX_BUDGET_WAIT_SECS)
+
+
+class _BudgetedNetwork(DefaultNetwork):
+    """DefaultNetwork that counts every request against the Box call budget."""
+
+    def request(self, method, url, access_token, **kwargs):
+        _take_box_call()
+        return super().request(method, url, access_token, **kwargs)
+
+
 @functools.lru_cache(maxsize=None)
 def get_login_as_user(auth_path, username):
-    auth = JWTAuth.from_settings_file(str(auth_path))
-    admin_client = Client(auth)  # token minted for the app's service account
+    network = _BudgetedNetwork()
+    auth = JWTAuth.from_settings_file(str(auth_path), session=Session(network_layer=network))
+    admin_client = Client(auth, session=AuthorizedSession(auth, network_layer=network))
     # Look up your managed user by email (requires Manage Users scope)
     users = admin_client.users(limit=1000, filter_term=username)
     target = next((u for u in users), None)
@@ -263,6 +429,16 @@ def upload_directory_to_box(dirname, attorney, client, subject,
     n_files, total_bytes, tree_text = package_summary(dirname)
     source = identify_source(sender, subject, body_text)
 
+    local_dir = Path(dirname).resolve()
+    bundles = _bundle_dirs(local_dir)
+    if bundles:
+        extra = list(extra or []) + [(
+            "Zipped",
+            "; ".join(f"{p.relative_to(local_dir).as_posix()} ({n:,} files)"
+                      for p, n in bundles.items())
+            + " — each is a .zip inside its folder; files over 1 GB are beside it",
+        )]
+
     email_kwargs = dict(
         client=client, attorney=attorney, team=team, casenum=casenum,
         sender=sender, body_text=body_text, box_url=box_url,
@@ -288,5 +464,5 @@ def upload_directory_to_box(dirname, attorney, client, subject,
 
     log.info("Uploading to Box: %s (%s files, %s)", outdir_on_box, n_files,
              human_readable_size(total_bytes))
-    upload_folder_recursive(user_client, Path(dirname).resolve(), dest_id)
+    upload_folder_recursive(user_client, local_dir, dest_id, bundles)
     return email_message
