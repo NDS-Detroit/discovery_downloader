@@ -13,6 +13,7 @@ import time
 import zipfile
 from contextlib import closing
 from pathlib import Path
+from types import SimpleNamespace
 
 from boxsdk import JWTAuth, Client # type: ignore
 from boxsdk.exception import BoxAPIException
@@ -33,8 +34,8 @@ JUNK_DIRS  = {"__MACOSX", ".git", ".venv", ".idea", ".pytest_cache", ".mypy_cach
 JUNK_FILES = {".DS_Store", "Thumbs.db", "desktop.ini"}
 
 # ---------------- bundling ----------------
-BUNDLE_MIN_FILES = 1_000               # subfolders with more files than this upload as one zip
-BUNDLE_MAX_FILE_BYTES = 1024 ** 3      # files this size or larger stay out of the zip
+BUNDLE_MIN_FILES = 200                 # subfolders with more files than this upload as one zip
+BUNDLE_MAX_FILE_BYTES = 50 * 1024 ** 2 # files this size or larger stay out of the zip
 
 # ---------------- Box API call budget ----------------
 # Every Box request from this machine is counted in _CALLS_DB. At the monthly
@@ -170,48 +171,52 @@ def _upload_or_rename(client: Client, local_file: pathlib.Path, dest_folder_id: 
         i += 1
 
     log.info("Uploading %s to Box folder %s", local_file, dest_folder_id)
-    with open(local_file, "rb") as f:
-        # use chunked uploader for large files
+    # One request per file; parts (one call each) only above the account's
+    # single-upload size limit.
+    uploaded = None
+    try:
+        with open(local_file, "rb") as f:
+            uploaded = folder.upload_stream(f, candidate)
+    except BoxAPIException as e:
+        if e.status != 413:
+            raise
+        log.info("%s is over the single-upload limit; uploading in parts", local_file)
+    if uploaded is None:
         size = local_file.stat().st_size
-        if size >= 500 * 1024 * 1024 and hasattr(folder, "get_chunked_uploader"):
-            # Large files: create a fresh upload session and upload once.
-            while True:
-                session = None
+        while True:
+            session = None
+            try:
+                # Preflight to catch name conflict or duplicate SHA1
                 try:
-                    # Preflight to catch name conflict or duplicate SHA1
-                    try:
-                        folder.preflight_check(size=size, name=candidate)
-                    except BoxAPIException as pe:
-                        if pe.status == 409:
-                            if _is_same_content_conflict(pe):
-                                log.info("Skipping duplicate (same SHA1): %s", local_file)
-                                return
-                            candidate = f"{base} ({i}){ext}"; i += 1
-                            continue
-                        raise
-
-                    # Create a NEW session every attempt
-                    session = folder.create_upload_session(size, candidate)
-                    uploader = session.get_chunked_uploader(str(local_file))
-                    uploaded = uploader.start()  # uploads all parts + commit
-                    break  # success
-
-                except BoxAPIException as e:
-                    # If a part already exists in this session, abort and try a fresh session
-                    if e.status == 409 and ("Part id" in getattr(e, "message", "") or
-                                            "part" in (e.context_info or {}).get("code", "").lower()):
-                        try:
-                            if session:
-                                session.abort()
-                        except Exception:
-                            pass
-                        # try again with a fresh session (same candidate name)
+                    folder.preflight_check(size=size, name=candidate)
+                except BoxAPIException as pe:
+                    if pe.status == 409:
+                        if _is_same_content_conflict(pe):
+                            log.info("Skipping duplicate (same SHA1): %s", local_file)
+                            return
+                        candidate = f"{base} ({i}){ext}"; i += 1
                         continue
-                    # Name conflict or same-content duplicate already handled above; otherwise re-raise
                     raise
 
-        else:
-            uploaded = folder.upload_stream(f, candidate)
+                # Create a NEW session every attempt
+                session = folder.create_upload_session(size, candidate)
+                uploader = session.get_chunked_uploader(str(local_file))
+                uploaded = uploader.start()  # uploads all parts + commit
+                break  # success
+
+            except BoxAPIException as e:
+                # If a part already exists in this session, abort and try a fresh session
+                if e.status == 409 and ("Part id" in getattr(e, "message", "") or
+                                        "part" in (e.context_info or {}).get("code", "").lower()):
+                    try:
+                        if session:
+                            session.abort()
+                    except Exception:
+                        pass
+                    # try again with a fresh session (same candidate name)
+                    continue
+                # Name conflict or same-content duplicate already handled above; otherwise re-raise
+                raise
     children[candidate] = uploaded
 
 def _bundle_dirs(local_dir: Path) -> dict:
@@ -265,16 +270,16 @@ def _zip_small_files(src: Path, zip_path: Path) -> list:
 
 
 def upload_folder_recursive(client, local_dir: pathlib.Path, dest_folder_id: str,
-                            bundles: dict | None = None):
+                            bundles: dict | None = None, dest_is_new: bool = False):
     """Mirror local_dir into dest_folder_id. Each pre-existing Box folder is
-    listed once; folders created here start empty and are never listed.
+    listed once; folders created here (or dest, when dest_is_new) are never listed.
     Each folder in `bundles` (default _bundle_dirs) uploads as <name>.zip inside
     its Box folder, with files too big to zip uploaded beside it."""
     local_dir = Path(local_dir)
     if bundles is None:
         bundles = _bundle_dirs(local_dir)
     rel_to_box = {pathlib.Path("."): dest_folder_id}
-    listings = {}  # Box folder id -> {name: item}
+    listings = {dest_folder_id: {}} if dest_is_new else {}  # Box folder id -> {name: item}
 
     def children_of(folder_id):
         if folder_id not in listings:
@@ -287,6 +292,7 @@ def upload_folder_recursive(client, local_dir: pathlib.Path, dest_folder_id: str
         if existing is not None and existing.type == "folder":
             return existing.id
         sub_id, created = _create_or_get_folder(client.folder(parent_id), name)
+        children_of(parent_id)[name] = SimpleNamespace(id=sub_id, type="folder", name=name)
         if created:
             listings[sub_id] = {}
         return sub_id
@@ -422,7 +428,7 @@ def upload_directory_to_box(dirname, attorney, client, subject,
     outdir_on_box = Path(dirname).name.split('-package')[0] + f"-{date_str}"
 
     user_client = get_login_as_user(BOX_AUTH_PATH, BOX_USER)
-    dest_id, _ = _create_or_get_folder(user_client.folder(BOX_EVIDENCE_FOLDER_ID),
+    dest_id, dest_is_new = _create_or_get_folder(user_client.folder(BOX_EVIDENCE_FOLDER_ID),
                                        _sanitize(outdir_on_box))
     box_url = f"https://app.box.com/folder/{dest_id}"
 
@@ -436,7 +442,7 @@ def upload_directory_to_box(dirname, attorney, client, subject,
             "Zipped",
             "; ".join(f"{p.relative_to(local_dir).as_posix()} ({n:,} files)"
                       for p, n in bundles.items())
-            + " — each is a .zip inside its folder; files over 1 GB are beside it",
+            + " — each is a .zip inside its folder; files of 50 MB or more are beside it",
         )]
 
     email_kwargs = dict(
@@ -464,5 +470,5 @@ def upload_directory_to_box(dirname, attorney, client, subject,
 
     log.info("Uploading to Box: %s (%s files, %s)", outdir_on_box, n_files,
              human_readable_size(total_bytes))
-    upload_folder_recursive(user_client, local_dir, dest_id, bundles)
+    upload_folder_recursive(user_client, local_dir, dest_id, bundles, dest_is_new)
     return email_message
